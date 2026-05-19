@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# bin/drift — drift command dispatcher
+# Subcommands: prepare, sync, list, status, delete, upgrade, help
+
+set -euo pipefail
+
+# ── Locate source dir ──────────────────────────────────────────────────────────
+# The canonical source dir is written by install.sh into ~/.config/drift/config.
+# If that file exists, source it; otherwise fall back to the repo containing
+# this script (useful for running directly from a checkout without installing).
+DRIFT_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/drift/config"
+
+if [[ -f "$DRIFT_CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$DRIFT_CONFIG_FILE"
+fi
+
+if [[ -z "${DRIFT_SOURCE_DIR:-}" ]]; then
+  _SCRIPT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+  DRIFT_SOURCE_DIR="$(cd -- "$_SCRIPT/.." && pwd -P)"
+fi
+
+# ── Workspaces dir (overridable) ───────────────────────────────────────────────
+DRIFT_WORKSPACES_DIR="${DRIFT_WORKSPACES_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/drift/workspaces}"
+export DRIFT_SOURCE_DIR DRIFT_WORKSPACES_DIR
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+die()  { echo "Error: $*" >&2; exit 1; }
+info() { echo "$*"; }
+
+# ── Usage ──────────────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+drift — isolated AI workspace manager
+
+Usage:
+  drift prepare <name> <folder> [folder2 ...]   Create a workspace
+  drift sync    <workspace> [--3way|--reject] [--dry-run|--patch] [--force]
+                                                Sync changes back to originals
+  drift list                                    List existing workspaces
+  drift status  <workspace>                     Show workspace details
+  drift delete  <workspace> [--force]           Delete a workspace
+  drift upgrade                                 Update drift via git pull
+  drift help                                    Show this help
+
+Workspaces directory: $DRIFT_WORKSPACES_DIR
+  Override with: export DRIFT_WORKSPACES_DIR=<path>
+
+Source directory:     $DRIFT_SOURCE_DIR
+EOF
+}
+
+# ── Subcommand: list ───────────────────────────────────────────────────────────
+cmd_list() {
+  if [[ ! -d "$DRIFT_WORKSPACES_DIR" ]]; then
+    info "No workspaces directory found: $DRIFT_WORKSPACES_DIR"
+    return 0
+  fi
+
+  local count=0
+  while IFS= read -r -d '' ws; do
+    local name
+    name="$(basename -- "$ws")"
+    local meta="${DRIFT_WORKSPACES_DIR}/${name}.meta"
+    if [[ -f "$meta" ]]; then
+      local created
+      created="$(grep -m1 '^workspace.created=' "$meta" | cut -d= -f2-)"
+      printf "  %-30s  %s\n" "$name" "${created:-unknown}"
+    else
+      printf "  %-30s  (no meta)\n" "$name"
+    fi
+    (( count++ )) || true
+  done < <(find "$DRIFT_WORKSPACES_DIR" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+
+  local orphan_count=0
+  while IFS= read -r -d '' meta; do
+    local name
+    name="$(basename -- "$meta" .meta)"
+    if [[ ! -d "$DRIFT_WORKSPACES_DIR/$name" ]]; then
+      if [[ $orphan_count -eq 0 ]]; then
+        [[ $count -gt 0 ]] && echo ""
+        info "  Orphaned meta files (workspace dir missing — safe to remove):"
+      fi
+      printf "  %-30s  %s\n" "${name} (orphaned)" "$meta"
+      (( orphan_count++ )) || true
+    fi
+  done < <(find "$DRIFT_WORKSPACES_DIR" -mindepth 1 -maxdepth 1 -name "*.meta" -type f -print0 | sort -z)
+
+  if [[ $count -eq 0 && $orphan_count -eq 0 ]]; then
+    info "No workspaces found in $DRIFT_WORKSPACES_DIR"
+  fi
+}
+
+# ── Helper: resolve workspace name or path → absolute dir + meta ──────────────
+# Sets WS_DIR and WS_META; dies with a clear message on failure.
+# For delete, pass a second argument "strict" to also enforce that WS_DIR is
+# inside DRIFT_WORKSPACES_DIR (prevents accidental out-of-bounds deletion).
+resolve_workspace() {
+  local arg="$1"
+  local strict="${2:-}"
+  local dir="$arg"
+
+  if [[ "$arg" != */* && ! -d "$arg" ]]; then
+    dir="$DRIFT_WORKSPACES_DIR/$arg"
+  fi
+
+  if command -v realpath >/dev/null 2>&1; then
+    dir="$(realpath -- "$dir" 2>/dev/null)" || dir="$dir"
+  else
+    [[ -d "$dir" ]] && dir="$(cd -- "$dir" && pwd -P)" || true
+  fi
+
+  [[ -d "$dir" ]] || die "Workspace not found: $arg"
+
+  local meta="${dir}.meta"
+  [[ -f "$meta" ]] || die "Meta file not found: ${meta}
+  Was this workspace created with 'drift prepare'?"
+
+  grep -q '^workspace\.name=' "$meta" \
+    || die "File '$meta' does not look like a drift meta file."
+
+  if [[ "$strict" == "strict" ]]; then
+    local ws_root
+    if command -v realpath >/dev/null 2>&1; then
+      ws_root="$(realpath -- "$DRIFT_WORKSPACES_DIR" 2>/dev/null || echo "$DRIFT_WORKSPACES_DIR")"
+    else
+      ws_root="$DRIFT_WORKSPACES_DIR"
+    fi
+    [[ "$dir" == "$ws_root/"* ]] \
+      || die "Refusing to delete '$dir': not inside the workspaces directory ($ws_root)."
+  fi
+
+  WS_DIR="$dir"
+  WS_META="$meta"
+}
+
+# ── Subcommand: status ─────────────────────────────────────────────────────────
+cmd_status() {
+  [[ $# -ge 1 ]] || die "Usage: drift status <workspace>"
+  resolve_workspace "$1"
+
+  local name created
+  name="$(grep -m1 '^workspace.name=' "$WS_META" | cut -d= -f2-)"
+  created="$(grep -m1 '^workspace.created=' "$WS_META" | cut -d= -f2-)"
+
+  info "Workspace: $name"
+  info "  Path:     $WS_DIR"
+  info "  Created:  ${created:-unknown}"
+  info ""
+
+  local src_count
+  src_count="$(grep -c '^source\.[0-9]*\.name=' "$WS_META" || true)"
+  if [[ "$src_count" -gt 0 ]]; then
+    info "  Sources ($src_count):"
+    for (( i=1; i<=src_count; i++ )); do
+      local sname spath
+      sname="$(grep -m1 "^source.$i.name=" "$WS_META" | cut -d= -f2-)"
+      spath="$(grep -m1 "^source.$i.path=" "$WS_META" | cut -d= -f2-)"
+      local marker=""
+      [[ -d "$spath" ]] || marker=" (⚠ original not found)"
+      info "    $sname  →  $spath${marker}"
+    done
+    info ""
+  fi
+
+  if [[ -d "$WS_DIR/.git" ]]; then
+    local branch commits_since
+    branch="$(git -C "$WS_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "detached")"
+    commits_since="$(git -C "$WS_DIR" rev-list --count HEAD 2>/dev/null || echo "?")"
+    info "  Git branch: $branch"
+    info "  Commits:    $commits_since (including initial snapshot)"
+
+    local staged unstaged untracked
+    staged="$(git -C "$WS_DIR" diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')"
+    unstaged="$(git -C "$WS_DIR" diff --name-only 2>/dev/null | wc -l | tr -d ' ')"
+    untracked="$(git -C "$WS_DIR" ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$staged" -gt 0 || "$unstaged" -gt 0 || "$untracked" -gt 0 ]]; then
+      info "  Working tree: $staged staged, $unstaged unstaged, $untracked untracked"
+    else
+      info "  Working tree: clean"
+    fi
+  else
+    info "  Git: (no .git directory)"
+  fi
+}
+
+# ── Subcommand: delete ─────────────────────────────────────────────────────────
+cmd_delete() {
+  local force=false
+  local name_arg=""
+
+  for arg in "$@"; do
+    case "$arg" in
+      --force) force=true ;;
+      -*) die "Unknown option: $arg" ;;
+      *)
+        [[ -z "$name_arg" ]] || die "Too many arguments. Usage: drift delete <workspace> [--force]"
+        name_arg="$arg"
+        ;;
+    esac
+  done
+
+  [[ -n "$name_arg" ]] || die "Usage: drift delete <workspace> [--force]"
+
+  resolve_workspace "$name_arg" "strict"
+
+  local display_name
+  display_name="$(basename -- "$WS_DIR")"
+
+  if [[ -d "$WS_DIR/.git" ]]; then
+    local commits
+    commits="$(git -C "$WS_DIR" rev-list --count HEAD 2>/dev/null || echo 0)"
+    if [[ "$commits" -gt 1 ]]; then
+      echo "  ⚠  This workspace has $commits commits ($(( commits - 1 )) after initial snapshot)."
+      echo "     Make sure you have synced any changes you want to keep."
+      echo ""
+    fi
+  fi
+
+  if [[ "$force" != true ]]; then
+    if [[ -t 0 ]]; then
+      echo "  This will permanently delete:"
+      echo "    $WS_DIR"
+      echo "    $WS_META"
+      read -r -p "  Delete workspace '$display_name'? [y/N] " CONFIRM
+      [[ "${CONFIRM:-n}" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
+    else
+      die "Non-interactive mode: use --force to confirm deletion."
+    fi
+  fi
+
+  rm -rf -- "$WS_DIR"
+  rm -f  -- "$WS_META"
+  info "✓ Deleted workspace: $display_name"
+}
+
+# ── Subcommand: upgrade ────────────────────────────────────────────────────────
+cmd_upgrade() {
+  command -v git >/dev/null 2>&1 || die "git is not installed or not in PATH."
+  [[ -d "$DRIFT_SOURCE_DIR/.git" ]] \
+    || die "Source directory is not a git repository: $DRIFT_SOURCE_DIR
+  Cannot upgrade. Clone the Drift repository and re-run install.sh."
+
+  info "Pulling latest changes in: $DRIFT_SOURCE_DIR"
+  git -C "$DRIFT_SOURCE_DIR" pull || die "git pull failed."
+
+  local bin_link="${HOME}/.local/bin/drift"
+  local expected="${DRIFT_SOURCE_DIR}/bin/drift"
+  if [[ -L "$bin_link" ]]; then
+    local current_target
+    current_target="$(readlink -- "$bin_link" 2>/dev/null || true)"
+    if [[ "$current_target" != "$expected" ]]; then
+      info "Updating symlink: $bin_link → $expected"
+      ln -sf -- "$expected" "$bin_link"
+    fi
+  fi
+
+  info ""
+  info "✓ drift upgraded."
+  git -C "$DRIFT_SOURCE_DIR" log -1 --oneline 2>/dev/null || true
+}
+
+# ── Dispatch ───────────────────────────────────────────────────────────────────
+SUBCMD="${1:-}"
+
+case "$SUBCMD" in
+  prepare)
+    shift
+    exec bash -- "$DRIFT_SOURCE_DIR/lib/prepare.sh" "$@"
+    ;;
+  sync)
+    shift
+    exec bash -- "$DRIFT_SOURCE_DIR/lib/sync.sh" "$@"
+    ;;
+  list)
+    cmd_list
+    ;;
+  status)
+    shift
+    cmd_status "$@"
+    ;;
+  delete)
+    shift
+    cmd_delete "$@"
+    ;;
+  upgrade)
+    cmd_upgrade
+    ;;
+  help|--help|-h)
+    usage
+    ;;
+  "")
+    usage
+    exit 1
+    ;;
+  *)
+    echo "Unknown subcommand: $SUBCMD" >&2
+    echo "Run 'drift help' for usage." >&2
+    exit 1
+    ;;
+esac
