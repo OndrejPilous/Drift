@@ -65,13 +65,27 @@ The workspace root is overridable via `$DRIFT_WORKSPACES_DIR`.
 **Creating the workspace**
 9. Creates `<WORKSPACES_DIR>/<name>/` with a single `mkdir`.
 10. Copies each source dir using `cp -a` (preserves permissions, symlinks, timestamps).
-11. Recursively finds and removes every `.git` directory and `.git` file (worktrees).
-12. Runs `git init` inside the workspace.
+11. **Gitignore inheritance** — if the source dir is inside a git repo, walks from the
+    git root down to `parent(source)` and collects `.gitignore` patterns, then appends
+    them to the **workspace root** `.gitignore` (`<WORKSPACES_DIR>/<name>/.gitignore`),
+    not to the source subdir's `.gitignore`. This keeps the inherited rules out of the
+    sync diff entirely — they are never patched back to the original.
+    - Non-anchored patterns (e.g. `node_modules/`, `*.log`) are written as-is; git
+      applies them at every directory level so they work from the workspace root.
+    - Anchored patterns (starting with `/`) are translated if they point strictly inside
+      the source dir: `/apps/v3/frontend/app/coverage/` → `/frontend/app/coverage/`
+      (prefixed with `/<basename>/` to anchor correctly at the workspace root).
+    - Anchored patterns with glob characters or pointing outside the source dir are skipped.
+    - Patterns are written under a `# ── drift: inherited gitignore rules for /<basename>` section.
+    - This makes the workspace self-contained in isolated environments where parent-level
+      `.gitignore` files would otherwise be invisible to agents or tools.
+12. Recursively finds and removes every `.git` directory and `.git` file (worktrees).
+13. Runs `git init` inside the workspace.
 
 **Metadata + initial commit**
-13. Writes `<name>.meta` (sibling to workspace dir) in `KEY=value` format — workspace
+14. Writes `<name>.meta` (sibling to workspace dir) in `KEY=value` format — workspace
     name, creation timestamp, and for each source: its absolute path and subdir name.
-14. Runs `git add -A && git commit` to record the exact starting state.
+15. Runs `git add -A && git commit` to record the exact starting state.
 
 ---
 
@@ -84,42 +98,76 @@ The workspace root is overridable via `$DRIFT_WORKSPACES_DIR`.
 2. Reads `DRIFT_WORKSPACES_DIR` from env to resolve workspace names.
 3. Reads `<workspace>.meta` — errors with a clear message if it is missing.
 4. Parses `workspace.name` and all `source.*` entries from the meta file.
-5. Creates a temp directory for patch files; registers a `trap` to delete it on exit.
+5. Creates a temp directory for patch files; registers a `_cleanup` trap to delete it
+   on exit and remove any linked worktree that may have been left behind.
 
 ### Per-source loop
 
 6. Reads `source.<n>.path` (original dir) and `source.<n>.subdir` (workspace subdir).
 7. Validates both directories exist on disk.
 
-**`--3way` pre-flight only**
+**`--3way` only: stash WIP**
 8. Checks the original is a git repository.
-9. Runs `git stash push -u` to stash WIP before the clean copy is made.
+9. Runs `git stash push -u` to save any dirty working tree state; records the stash ref
+   so sync can report it to the user.
 
-**Clean copy for diffing**
-10. Copies the original into a temp subdirectory, strips every `.git` entry.
-11. Creates a symlink to the workspace subdir alongside the clean copy.
+**`--3way` only: worktree-based tracked patch**
 
-**Generating the patch**
-12. Runs `git diff --no-index --binary --full-index -M` from the temp dir, producing
-    a unified diff with relative single-component paths.
+This is where `--3way` diverges from the other modes. Rather than diffing the
+filesystem with `git diff --no-index` (which would include gitignored files and cause
+`git apply --3way` to fail atomically when it encounters files not in the index), a
+linked worktree is used so that git's own index and gitignore machinery filter the diff.
+
+10. Creates a linked worktree with `git worktree add --no-checkout --detach`. The
+    `--no-checkout` flag skips the working tree checkout entirely — no smudge filters
+    (e.g. git-crypt) are triggered.
+11. Runs `git read-tree HEAD` inside the worktree to initialise the index from HEAD
+    without writing any files to disk.
+12. Copies all `.gitignore` files from the main working tree into the linked worktree at
+    the same relative paths. This is necessary because linked worktrees share `.git` but
+    NOT the main working tree's files, so file-based gitignore rules from the main tree
+    would otherwise be invisible to `git add` in the empty linked worktree.
+13. Removes the target subdir in the worktree, then copies the workspace files into it
+    (the copy overwrites the `.gitignore` in the subdir with the workspace's own version,
+    which is correct). For root-level sources the `.git` directory is preserved.
+14. Runs `git add -A` scoped to the subdir. Because the index is at HEAD and the worktree
+    now contains the workspace files, this stages exactly the tracked delta: modifications,
+    additions, and deletions. Gitignored files (dist/, coverage/, build artifacts) are
+    silently skipped by git's normal ignore machinery.
+15. Runs `git diff --cached HEAD` to produce `PATCH_TRACKED` — a clean patch with
+    repo-root-relative paths that `git apply` can consume without `-p2` or `--directory`.
+16. Removes the worktree with `git worktree remove --force`.
+17. If `PATCH_TRACKED` is empty, all differences are in gitignored files; reports
+    "No tracked changes to sync" and skips to the next source (exit 0).
+
+**All modes: raw filesystem patch**
+
+18. Copies the original into a temp subdirectory, strips every `.git` entry.
+19. Creates a symlink to the workspace subdir alongside the clean copy.
+20. Runs `git diff --no-index --binary --full-index -M` from the temp dir, producing
+    a raw unified diff with two-component paths (e.g. `a/orig/file` `b/ws/file`).
+    Used by `--patch`, `--dry-run`, and `--reject`; ignored for `--3way`.
 
 ### Output modes
 
 **`--patch`** — prints the raw diff to stdout; nothing is modified.
 
-**`--dry-run`** — runs `git apply --stat` and `--numstat`; nothing is modified.
+**`--dry-run`** — runs `git apply --stat` and `--numstat` on the raw diff; nothing is modified.
 
 ### Apply modes
 
 **`--3way`**
-13. Creates (or reuses) a `drift/<workspace-name>` safety branch in the original.
-14. Applies with `git apply --3way -p2` — conflicts get `<<<<`/`====`/`>>>>` markers.
-15. Reports unmerged paths and prints next-step instructions.
+21. Creates (or reuses) a `drift/<workspace-name>` safety branch in the original repo.
+22. Applies `PATCH_TRACKED` with `git apply --3way`. Paths in the patch are already
+    repo-root-relative (standard `-p1`), so no `-p2` or `--directory` flags are needed.
+    Conflicts produce `<<<<`/`====`/`>>>>` markers.
+23. Checks `git ls-files --unmerged` for conflict markers and `git diff --name-only HEAD`
+    for applied changes; reports the result and prints next-step instructions.
 
 **`--reject`**
-16. Warns about any file deletions; prompts interactively (or requires `--force`).
-17. Applies with `git apply --reject -p2` — failed hunks land in `<file>.rej`.
-18. Lists any `.rej` files left behind.
+24. Warns about any file deletions; prompts interactively (or requires `--force`).
+25. Applies the raw patch with `git apply --reject -p2` — failed hunks land in `<file>.rej`.
+26. Lists any `.rej` files left behind.
 
 ---
 

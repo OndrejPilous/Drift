@@ -407,6 +407,84 @@ run_sync "no-such-workspace-xyz" --3way
 assert_exit_err "$RUN_EXIT" "exits non-zero for unknown workspace name"
 assert_stderr_contains "$RUN_STDERR" "Workspace not found" "error mentions Workspace not found"
 
+# ── Test 20: --3way on a source that is a subdirectory of a git repo ─────────
+echo ""
+echo "=== Test 20: --3way on git subdir source ==="
+REPO="$TMP/t20-repo"
+ORIG="$REPO/packages/api"
+make_git_repo "$REPO" "packages/api/src/service.ts" "packages/api/lib/util.ts"
+WS="$(make_workspace "${P}-t20" "$ORIG")"
+echo "AI refactored" >> "$WS/api/src/service.ts"
+git -C "$WS" add -A
+git -C "$WS" commit --quiet -m "AI changes"
+
+run_sync "$WS" --3way
+assert_exit_ok "$RUN_EXIT" "exits 0 for subdir source"
+assert_file_contains "$ORIG/src/service.ts" "AI refactored" "change applied to subdir source"
+assert_branch_exists "$REPO" "drift/${P}-t20" "safety branch created in repo root"
+assert_no_rej_files "$ORIG" "no .rej files"
+
+# ── Test 21: --3way when patch only touches gitignored files ─────────────────
+echo ""
+echo "=== Test 21: --3way with only gitignored files in patch ==="
+ORIG="$TMP/t21-orig"
+make_git_repo "$ORIG" "src/app.ts"
+# Mark dist/ as gitignored in the original repo
+echo "dist/" >> "$ORIG/.gitignore"
+git -C "$ORIG" add .gitignore
+git -C "$ORIG" commit --quiet -m "Add .gitignore"
+# Put an existing (untracked, gitignored) dist file in the original
+mkdir -p "$ORIG/dist"
+echo "old build" > "$ORIG/dist/bundle.js"
+
+WS="$(make_workspace "${P}-t21" "$ORIG")"
+WS_SUBDIR="$WS/$(basename "$ORIG")"
+# Modify the dist file in the workspace — this is the only difference.
+# sync.sh diffs the filesystem with --no-index, so git tracking is irrelevant.
+echo "new build" > "$WS_SUBDIR/dist/bundle.js"
+
+run_sync "$WS" --3way
+assert_exit_ok "$RUN_EXIT" "exits 0 when only gitignored files differ"
+[[ "$RUN_STDOUT" == *"No tracked changes to sync"* ]] \
+  && _pass "output warns: no tracked changes" \
+  || _fail "output warns: no tracked changes (got: $RUN_STDOUT)"
+[[ "$RUN_STDOUT" == *"gitignored"* || "$RUN_STDOUT" == *"git index"* ]] \
+  && _pass "output mentions gitignored / index" \
+  || _fail "output mentions gitignored / index"
+
+# ── Test 22: --3way mixed tracked + gitignored changes ───────────────────────
+echo ""
+echo "=== Test 22: --3way tracked change lands, gitignored skipped ==="
+ORIG="$TMP/t22-orig"
+make_git_repo "$ORIG" "src/app.ts"
+echo 'version: "1.0"' > "$ORIG/package.json"
+echo "dist/" >> "$ORIG/.gitignore"
+git -C "$ORIG" add .
+git -C "$ORIG" commit --quiet -m "Add package.json and .gitignore"
+# Create gitignored dist file in original
+mkdir -p "$ORIG/dist"
+echo "old build" > "$ORIG/dist/bundle.js"
+
+WS="$(make_workspace "${P}-t22" "$ORIG")"
+WS_SUBDIR="$WS/$(basename "$ORIG")"
+# Modify both a tracked file and a gitignored file
+echo 'version: "2.0"' > "$WS_SUBDIR/package.json"
+echo "new build" > "$WS_SUBDIR/dist/bundle.js"
+
+run_sync "$WS" --3way
+assert_exit_ok "$RUN_EXIT" "exits 0 with mixed tracked+gitignored changes"
+# Tracked change must land
+[[ "$(git -C "$ORIG" diff HEAD -- package.json)" == *'version: "2.0"'* ]] \
+  && _pass "tracked package.json change landed" \
+  || _fail "tracked package.json change did NOT land"
+# Gitignored file must NOT be tracked
+git -C "$ORIG" ls-files --error-unmatch dist/bundle.js 2>/dev/null \
+  && _fail "dist/bundle.js must not be tracked" \
+  || _pass "dist/bundle.js not tracked (correct)"
+# Gitignored file content on disk must be unchanged (worktree must not have overwritten it)
+assert_file_contains "$ORIG/dist/bundle.js" "old build" "gitignored file content unchanged on disk"
+assert_no_rej_files "$ORIG" "no .rej files"
+
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "─────────────────────────────────────────"

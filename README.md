@@ -133,6 +133,8 @@ Result:
   .git/       ← fresh, no remotes
 ```
 
+If a source directory is inside a git repository, `drift prepare` also inherits upper-level `.gitignore` rules into the **workspace root** `.gitignore` (not the source subdir's `.gitignore`). Placing them at the workspace root means they are never diffed or synced back to the original repo, while remaining visible to any tool running inside the workspace. Anchored patterns are translated to include the source basename (e.g. `/apps/v3/frontend/app/coverage/` becomes `/frontend/app/coverage/`). Non-anchored patterns are written as-is since git applies them at every directory level.
+
 ### `drift sync`
 
 ```bash
@@ -183,7 +185,7 @@ When syncing back, you choose how conflicts are handled:
 
 | Flag | Behaviour | Use when |
 |---|---|---|
-| `--3way` | `git apply --3way` — failed hunks become `<<<<`/`====`/`>>>>` conflict markers | Your original is a git repo and you want standard merge-style resolution |
+| `--3way` | Uses a git worktree to produce a tracked-only patch, then applies it with `git apply --3way` — gitignored files (dist/, coverage/, build artifacts) are automatically excluded; failed hunks become `<<<<`/`====`/`>>>>` conflict markers | Your original is a git repo and you want standard merge-style resolution |
 | `--reject` | `git apply --reject` — failed hunks saved to `<file>.rej` | The original isn't a git repo, or you prefer to fix hunks manually |
 | `--dry-run` | Preview only — shows stats, modifies nothing | Before committing to an apply |
 | `--patch` | Prints the raw diff to stdout | Inspect the diff or pipe it into another tool |
@@ -223,6 +225,7 @@ See [INTERNALS.md](INTERNALS.md) for a step-by-step walkthrough of what each com
 - Workspace names are restricted to alphanumeric, hyphens, and underscores — no path traversal
 - Source dirs that are `/` or an ancestor of the workspaces directory are rejected
 - All `.git` directories *and* `.git` files (worktree pointers) are stripped recursively from copies
+- `--3way` sync uses a temporary linked worktree to produce the patch — gitignored files (dist/, coverage/, build artifacts, etc.) are always excluded, preventing them from disrupting the atomic apply
 
 ---
 

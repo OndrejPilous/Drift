@@ -90,11 +90,90 @@ done
 mkdir -- "$DEST" || die "Could not create directory: $DEST"
 info "Created workspace: $DEST"
 
+# ── Helper: inherit upper-level gitignore rules for workspace self-containment ─
+# Collects patterns from .gitignore files in parent directories (between the git
+# root and the source directory) and writes them to the workspace root .gitignore
+# under a clearly-marked drift section. Placing them at the workspace root (not
+# inside the source subdir) ensures they are never diffed or synced back to the
+# original repo, while still being visible to any tool running inside the workspace.
+#
+# Path adjustments written to <DEST>/.gitignore:
+#   - Non-anchored patterns (e.g. node_modules/) → written as-is (git applies them
+#     at every directory level, so they work from the workspace root too).
+#   - Anchored patterns pointing inside SRC (e.g. /apps/v3/frontend/app/coverage/)
+#     → translated to /<basename>/app/coverage/ so they are anchored correctly
+#     relative to the workspace root.
+_inherit_gitignores() {
+  local SRC="$1" BN="$2" WORKSPACE_GITIGNORE="$3"
+  local GIT_ROOT_SRC
+  GIT_ROOT_SRC="$(git -C "$SRC" rev-parse --show-toplevel 2>/dev/null)" || return 0
+
+  # Nothing to inherit when SRC is the git root itself
+  [[ "$SRC" == "$GIT_ROOT_SRC" ]] && return 0
+
+  # Relative path from git root to parent of SRC
+  local SRC_PARENT GIT_PARENT_REL
+  SRC_PARENT="$(dirname "$SRC")"
+  GIT_PARENT_REL="${SRC_PARENT#"$GIT_ROOT_SRC"}"
+  GIT_PARENT_REL="${GIT_PARENT_REL#/}"  # strip leading slash
+
+  # Build list: git root down to parent(SRC) inclusive
+  local DIRS_TO_CHECK=("$GIT_ROOT_SRC")
+  if [[ -n "$GIT_PARENT_REL" ]]; then
+    local CURRENT="$GIT_ROOT_SRC" PART _PATH_PARTS
+    IFS='/' read -ra _PATH_PARTS <<< "$GIT_PARENT_REL"
+    for PART in "${_PATH_PARTS[@]}"; do
+      CURRENT="$CURRENT/$PART"
+      DIRS_TO_CHECK+=("$CURRENT")
+    done
+  fi
+
+  # Collect patterns, rewriting paths to be relative to the workspace root.
+  local INHERITED_LINES=() DIR GITIGNORE_FILE LINE
+  for DIR in "${DIRS_TO_CHECK[@]}"; do
+    GITIGNORE_FILE="$DIR/.gitignore"
+    [[ -f "$GITIGNORE_FILE" ]] || continue
+    while IFS= read -r LINE; do
+      [[ -z "$LINE" || "$LINE" == \#* ]] && continue
+      if [[ "$LINE" == /* ]]; then
+        # Anchored patterns: translate only those pointing strictly inside SRC.
+        # Skip patterns with glob characters — they can't be path-resolved safely.
+        [[ "$LINE" == *\** || "$LINE" == *\?* || "$LINE" == *\[* ]] && continue
+        local PATTERN_BARE FULL_PATH REMAINING
+        PATTERN_BARE="${LINE%/}"; PATTERN_BARE="${PATTERN_BARE#/}"
+        FULL_PATH="$DIR/$PATTERN_BARE"
+        if [[ "$FULL_PATH" == "$SRC/"* ]]; then
+          REMAINING="${FULL_PATH#"$SRC/"}"
+          # Prefix with /<basename>/ so the pattern is anchored at the workspace root
+          [[ "$LINE" == */ ]] \
+            && INHERITED_LINES+=("/$BN/$REMAINING/") \
+            || INHERITED_LINES+=("/$BN/$REMAINING")
+        fi
+        continue
+      fi
+      # Non-anchored patterns apply at every level — no rewrite needed
+      INHERITED_LINES+=("$LINE")
+    done < "$GITIGNORE_FILE"
+  done
+
+  [[ ${#INHERITED_LINES[@]} -eq 0 ]] && return 0
+
+  {
+    printf '\n'
+    printf '# ── drift: inherited gitignore rules for /%s (from parent dirs in source repo)\n' "$BN"
+    printf '# ── Do not edit — managed by drift prepare\n'
+    printf '%s\n' "${INHERITED_LINES[@]}"
+  } >> "$WORKSPACE_GITIGNORE"
+  info "  Inherited ${#INHERITED_LINES[@]} gitignore pattern(s) from parent directories → workspace .gitignore"
+}
+
 # ── Copy source directories ───────────────────────────────────────────────────
+WORKSPACE_GITIGNORE="$DEST/.gitignore"
 for SRC in "${SOURCES[@]}"; do
   BN="$(basename -- "$SRC")"
   info "  Copying /$BN  ←  $SRC"
   cp -a -- "$SRC" "$DEST/$BN" || die "Failed to copy '$SRC'."
+  _inherit_gitignores "$SRC" "$BN" "$WORKSPACE_GITIGNORE"
 done
 
 # ── Strip all .git directories AND .git files (worktrees) ────────────────────

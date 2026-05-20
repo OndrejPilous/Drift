@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # lib/sync.sh
-# Apply AI changes from a drift workspace back to the original source directories.
-# Uses git diff --no-index to compare workspace subdirs against their origins,
-# then applies the resulting patch with the user's chosen method.
+# Apply changes from a drift workspace back to the original source directories.
+#
+# --3way: uses a linked git worktree to produce a tracked-only patch (via
+#         git diff --cached HEAD), then applies it with git apply --3way.
+#         Gitignored files are excluded by git's own machinery.
+# --reject/--dry-run/--patch: use git diff --no-index to diff the filesystem.
 #
 # Called by: drift sync <workspace> [--3way | --reject] [--dry-run | --patch] [--force]
 # Env:       DRIFT_WORKSPACES_DIR  — where workspaces are stored
@@ -26,7 +29,8 @@ Usage: drift sync <workspace> [--3way | --reject] [--dry-run | --patch] [--force
     --3way      Apply with 'git apply --3way'. Produces standard <<<< conflict
                 markers in-file. Requires the original to be a git repository.
                 Staged/unstaged changes in the original are stashed automatically
-                before applying and restored afterwards.
+                before applying. The stash is NOT auto-popped — run
+                'git stash pop' yourself after reviewing the applied changes.
 
     --reject    Apply with 'git apply --reject'. Best-effort: hunks that cannot
                 apply cleanly are written to <file>.rej alongside the original.
@@ -120,7 +124,15 @@ SOURCE_COUNT="$(grep -c '^source\.[0-9]*\.name=' "$META" || true)"
 
 # ── Build a temp dir for patches ─────────────────────────────────────────────
 TMPDIR_PATCHES="$(mktemp -d)"
-trap 'rm -rf -- "$TMPDIR_PATCHES"' EXIT
+WKTREE_DIR=""
+WKTREE_GIT_ROOT=""
+_cleanup() {
+  if [[ -n "${WKTREE_DIR:-}" && -n "${WKTREE_GIT_ROOT:-}" ]]; then
+    git -C "$WKTREE_GIT_ROOT" worktree remove --force "$WKTREE_DIR" 2>/dev/null || true
+  fi
+  rm -rf -- "$TMPDIR_PATCHES"
+}
+trap '_cleanup' EXIT
 
 # ── Process each source ───────────────────────────────────────────────────────
 OVERALL_EXIT=0
@@ -152,14 +164,23 @@ for (( i=1; i<=SOURCE_COUNT; i++ )); do
   WS_LINK="$TMPDIR_PATCHES/${NAME}.ws"
   STASH_REF=""
 
+  # Detect the git repo root — works whether ORIG_PATH is the root or a subdirectory.
+  GIT_ROOT=""
+  REL_SUBDIR=""
+  if git -C "$ORIG_PATH" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    GIT_ROOT="$(git -C "$ORIG_PATH" rev-parse --show-toplevel)"
+    REL_SUBDIR="$(git -C "$ORIG_PATH" rev-parse --show-prefix)"
+    REL_SUBDIR="${REL_SUBDIR%/}"   # strip trailing slash; empty when ORIG_PATH is the root
+  fi
+
   if [[ "$OUTPUT_MODE" == "apply" && "$METHOD" == "3way" ]]; then
-    [[ -d "$ORIG_PATH/.git" ]] \
-      || die "Original '$ORIG_PATH' is not a git repository.
+    [[ -n "$GIT_ROOT" ]] \
+      || die "Original '$ORIG_PATH' is not inside a git repository.
   Use --reject for non-git directories."
 
     STASH_MSG="drift: your work-in-progress before syncing workspace '$WORKSPACE_NAME' ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
     set +e
-    STASH_RESULT="$(git -C "$ORIG_PATH" stash push -u -m "$STASH_MSG" 2>&1)"
+    STASH_RESULT="$(git -C "$GIT_ROOT" stash push -u -m "$STASH_MSG" 2>&1)"
     STASH_EXIT=$?
     set -e
 
@@ -172,6 +193,49 @@ for (( i=1; i<=SOURCE_COUNT; i++ )); do
       STASH_REF="stash@{0}"
       info "  ↓ Your WIP has been saved to the stash: '$STASH_MSG'"
       info "    Recover it later with: git stash pop"
+    fi
+
+    # Generate a tracked-only patch using a linked worktree so that gitignored files
+    # (dist/, node_modules/, build artefacts, etc.) never enter the apply transaction.
+    # The linked worktree shares the real .git directory — all gitignore sources apply.
+    PATCH_TRACKED="$TMPDIR_PATCHES/${NAME}.tracked.patch"
+    WKTREE_GIT_ROOT="$GIT_ROOT"
+    WKTREE_DIR="$TMPDIR_PATCHES/${NAME}.wt"
+    git -C "$GIT_ROOT" worktree add --quiet --no-checkout --detach "$WKTREE_DIR" HEAD
+    git -C "$WKTREE_DIR" read-tree HEAD
+
+    # Populate the worktree with .gitignore files from the main working tree so
+    # that 'git add -A' below sees the full gitignore rule set. Linked worktrees
+    # share .git but NOT the working tree, so file-based .gitignore rules from the
+    # main tree are invisible unless we explicitly copy them.
+    # The workspace copy that follows will overwrite any .gitignore inside
+    # REL_SUBDIR with the workspace's own version, which is correct.
+    find "$GIT_ROOT" -name ".gitignore" -not -path "*/.git/*" -print0 \
+      | while IFS= read -r -d '' gisrc; do
+        girel="${gisrc#"$GIT_ROOT/"}"
+        gitgt="$WKTREE_DIR/$girel"
+        mkdir -p -- "$(dirname "$gitgt")"
+        cp -- "$gisrc" "$gitgt" 2>/dev/null || true
+      done
+
+    if [[ -n "$REL_SUBDIR" ]]; then
+      rm -rf -- "$WKTREE_DIR/$REL_SUBDIR"
+      mkdir -p -- "$WKTREE_DIR/$REL_SUBDIR"
+      cp -a -- "$WORKSPACE_SUBDIR/." "$WKTREE_DIR/$REL_SUBDIR/"
+    else
+      find "$WKTREE_DIR" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf -- {} +
+      cp -a -- "$WORKSPACE_SUBDIR/." "$WKTREE_DIR/"
+    fi
+    git -C "$WKTREE_DIR" add -A -- "${REL_SUBDIR:-.}"
+    git -C "$WKTREE_DIR" diff --cached --binary --full-index -M HEAD \
+      ${REL_SUBDIR:+-- "$REL_SUBDIR"} > "$PATCH_TRACKED"
+    git -C "$GIT_ROOT" worktree remove --force "$WKTREE_DIR"
+    WKTREE_DIR=""   # prevent double-remove in EXIT trap
+
+    if [[ ! -s "$PATCH_TRACKED" ]]; then
+      info "  ✓ No tracked changes to sync (workspace only differs in gitignored files)."
+      [[ -n "${STASH_REF:-}" ]] && git -C "$GIT_ROOT" stash pop --quiet
+      continue
     fi
   fi
 
@@ -222,12 +286,12 @@ for (( i=1; i<=SOURCE_COUNT; i++ )); do
   if [[ "$METHOD" == "3way" ]]; then
 
     BRANCH="drift/$WORKSPACE_NAME"
-    CURRENT_BRANCH="$(git -C "$ORIG_PATH" symbolic-ref --short HEAD 2>/dev/null || echo "HEAD")"
-    if git -C "$ORIG_PATH" rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
-      warn "Branch '$BRANCH' already exists in $ORIG_PATH — reusing it."
-      git -C "$ORIG_PATH" checkout "$BRANCH" --quiet
+    CURRENT_BRANCH="$(git -C "$GIT_ROOT" symbolic-ref --short HEAD 2>/dev/null || echo "HEAD")"
+    if git -C "$GIT_ROOT" rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+      warn "Branch '$BRANCH' already exists in $GIT_ROOT — reusing it."
+      git -C "$GIT_ROOT" checkout "$BRANCH" --quiet
     else
-      git -C "$ORIG_PATH" checkout -b "$BRANCH" --quiet
+      git -C "$GIT_ROOT" checkout -b "$BRANCH" --quiet
       info "  ✓ Safety branch created: $BRANCH"
       info "    To discard this sync: git checkout $CURRENT_BRANCH && git branch -D $BRANCH"
     fi
@@ -235,24 +299,40 @@ for (( i=1; i<=SOURCE_COUNT; i++ )); do
     info ""
     info "  Applying with --3way..."
     set +e
-    git -C "$ORIG_PATH" apply --3way --whitespace=nowarn -p2 "$PATCH_RAW" 2>&1 \
-      | sed 's/^/    /'
+    git -C "$GIT_ROOT" apply --3way --whitespace=nowarn "$PATCH_TRACKED" 2>&1 | sed 's/^/    /'
     set -e
 
     info ""
-    UNMERGED="$(git -C "$ORIG_PATH" ls-files --unmerged 2>/dev/null | awk '{print $4}' | sort -u)"
+    UNMERGED="$(git -C "$GIT_ROOT" ls-files --unmerged 2>/dev/null | awk '{print $4}' | sort -u)"
+    # Collect changed files that are not gitignored (i.e. genuinely tracked source files).
+    TRACKED_CHANGES=""
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      git -C "$GIT_ROOT" check-ignore -q -- "$f" 2>/dev/null || TRACKED_CHANGES+="$f"$'\n'
+    done < <(git -C "$GIT_ROOT" diff --name-only HEAD 2>/dev/null || true)
     info "  Result:"
-    git -C "$ORIG_PATH" diff --stat HEAD 2>/dev/null | sed 's/^/    /' || true
+    git -C "$GIT_ROOT" diff --stat HEAD 2>/dev/null | sed 's/^/    /' || true
     if [[ -n "$UNMERGED" ]]; then
       info ""
       info "  ⚠  Conflicts (resolve these files):"
       echo "$UNMERGED" | sed 's/^/    /'
       info ""
       info "  Next steps:"
-      info "    cd $ORIG_PATH"
+      info "    cd $GIT_ROOT"
       info "    git mergetool              # resolve conflicts"
       info "    git add -A && git commit -m 'Apply workspace changes from $WORKSPACE_NAME'"
       info "    git branch -D $BRANCH     # clean up safety branch when done"
+      [[ -n "${STASH_REF:-}" ]] && \
+        info "    git stash pop              # restore your saved WIP"
+      OVERALL_EXIT=1
+    elif [[ -z "$TRACKED_CHANGES" ]]; then
+      info ""
+      info "  ⚠  No tracked file changes were applied."
+      info "     If you expected source changes, verify that those files are tracked in the original repo."
+      info ""
+      info "  Next steps:"
+      info "    cd $GIT_ROOT"
+      info "    git checkout $CURRENT_BRANCH && git branch -D $BRANCH  # discard safety branch"
       [[ -n "${STASH_REF:-}" ]] && \
         info "    git stash pop              # restore your saved WIP"
       OVERALL_EXIT=1
@@ -261,7 +341,7 @@ for (( i=1; i<=SOURCE_COUNT; i++ )); do
       info "  ✓ Applied cleanly — no conflicts."
       info ""
       info "  Next steps:"
-      info "    cd $ORIG_PATH"
+      info "    cd $GIT_ROOT"
       info "    git diff HEAD              # review changes"
       info "    git add -A && git commit -m 'Apply workspace changes from $WORKSPACE_NAME'"
       info "    git branch -D $BRANCH     # clean up safety branch when done"
